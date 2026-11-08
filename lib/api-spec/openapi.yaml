@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: sms
+    description: Twilio inbound SMS webhooks
 paths:
   /healthz:
     get:
@@ -24,6 +26,31 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /twilio/inbound:
+    post:
+      operationId: recordTwilioInboundSms
+      tags: [sms]
+      summary: Receive an inbound Twilio SMS
+      description: Processes Twilio opt-out and opt-in keywords after signature validation.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: "#/components/schemas/TwilioInboundMessage"
+      responses:
+        "200":
+          description: Empty TwiML response. Twilio manages keyword confirmations.
+          content:
+            application/xml:
+              schema:
+                type: string
+        "400":
+          description: Invalid inbound webhook payload
+        "403":
+          description: Invalid Twilio signature
+        "503":
+          description: Webhook validation is not configured
 components:
   schemas:
     HealthStatus:
@@ -33,4 +60,27 @@ components:
           type: string
       required:
         - status
+    TwilioInboundMessage:
+      type: object
+      additionalProperties: true
+      required:
+        - From
+        - To
+        - Body
+        - MessageSid
+      properties:
+        From:
+          type: string
+          pattern: "^\\+[1-9][0-9]{7,14}$"
+        To:
+          type: string
+          pattern: "^\\+[1-9][0-9]{7,14}$"
+        Body:
+          type: string
+          maxLength: 1600
+        MessageSid:
+          type: string
+        OptOutType:
+          type: string
+          enum: [START, STOP, HELP]
 
