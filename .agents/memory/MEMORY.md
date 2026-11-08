@@ -1,0 +1,1 @@
+- [Twilio SMS access](twilio-sms-access.md) — use the SDK with Replit Secrets; the user dismissed the Twilio integration.
