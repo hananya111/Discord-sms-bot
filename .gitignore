@@ -16,6 +16,15 @@ out-tsc
 
 # dependencies
 node_modules
+.pythonlibs/
+.venv/
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.sms_rate_limits.sqlite3
 
 # IDEs and editors
 /.idea

@@ -1,9 +1,11 @@
-# [Project name]
+# Discord SMS Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+An administrator-only Discord bot for sending consent-based, one-off SMS messages through Twilio. The workspace also retains the shared API and canvas scaffolds.
 
 ## Run & Operate
 
+- Start the **Discord SMS Bot** workflow, or run `python discord_sms_bot.py`
+- Required secrets: `DISCORD_TOKEN`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER`
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
@@ -13,6 +15,7 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Stack
 
+- Python 3.13, discord.py, Twilio Python SDK
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5
 - DB: PostgreSQL + Drizzle ORM
@@ -22,15 +25,20 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `discord_sms_bot.py` — Discord slash commands and Twilio SMS sending
+- `README.md` — bot setup and operating notes
+- `artifacts/api-server` — shared Express API
+- `artifacts/mockup-sandbox` — canvas component previews
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- SMS sends require Discord administrator permission and explicit consent confirmation.
+- Each recipient has a one-hour in-memory cooldown; restarting the bot resets it.
+- The bot does not automatically process incoming `STOP` messages; honor opt-outs before using `/sms`.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+The bot provides `/sms`, `/test`, and `/help` commands. SMS is sent only through the configured Twilio account.
 
 ## User preferences
 
