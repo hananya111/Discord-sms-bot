@@ -1,1 +1,2 @@
 - [Twilio SMS access](twilio-sms-access.md) — use the SDK with Replit Secrets; the user dismissed the Twilio integration.
+- [Twilio opt-out replies](twilio-opt-out.md) — when `OptOutType` is present, return empty TwiML because Twilio already sent the confirmation.
