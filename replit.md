@@ -6,6 +6,7 @@ An administrator-only Discord bot for sending consent-based, one-off SMS message
 
 - Start the **Discord SMS Bot** workflow, or run `python discord_sms_bot.py`
 - Required secrets: `DISCORD_TOKEN`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER`
+- Twilio inbound webhook: `POST /api/twilio/inbound`; configure the public HTTPS URL in Twilio
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
@@ -26,6 +27,9 @@ An administrator-only Discord bot for sending consent-based, one-off SMS message
 ## Where things live
 
 - `discord_sms_bot.py` — Discord slash commands and Twilio SMS sending
+- `sms_opt_out.py` — durable database check before sending SMS
+- `artifacts/api-server/src/routes/twilio-inbound.ts` — signed Twilio opt-out webhook
+- `lib/db/src/schema/sms-recipient-preferences.ts` — persisted opt-in/opt-out status
 - `README.md` — bot setup and operating notes
 - `artifacts/api-server` — shared Express API
 - `artifacts/mockup-sandbox` — canvas component previews
@@ -34,7 +38,8 @@ An administrator-only Discord bot for sending consent-based, one-off SMS message
 
 - SMS sends require Discord administrator permission and explicit consent confirmation.
 - Each recipient has a one-hour in-memory cooldown; restarting the bot resets it.
-- The bot does not automatically process incoming `STOP` messages; honor opt-outs before using `/sms`.
+- Inbound Twilio opt-out requests are signature-validated and stored as SHA-256 phone hashes.
+- The bot fails closed when it cannot verify the stored opt-out status.
 
 ## Product
 

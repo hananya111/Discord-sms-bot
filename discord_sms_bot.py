@@ -10,6 +10,8 @@ from discord import app_commands
 from discord.ext import commands
 from twilio.rest import Client
 
+from sms_opt_out import is_recipient_opted_out
+
 LOGGER = logging.getLogger("discord_sms_bot")
 MAX_MESSAGE_LENGTH = 500
 RECIPIENT_COOLDOWN_SECONDS = 60 * 60
@@ -115,10 +117,34 @@ def build_bot(settings: Settings) -> commands.Bot:
             )
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            opted_out = await asyncio.to_thread(
+                is_recipient_opted_out,
+                recipient,
+            )
+        except Exception as error:
+            LOGGER.error(
+                "Could not verify SMS opt-out status (exception=%s)",
+                type(error).__name__,
+            )
+            await interaction.followup.send(
+                "לא ניתן לבדוק אם המספר הוסר. ההודעה לא נשלחה.",
+                ephemeral=True,
+            )
+            return
+
+        if opted_out:
+            await interaction.followup.send(
+                "המספר ביקש להסיר את עצמו. ההודעה לא נשלחה.",
+                ephemeral=True,
+            )
+            return
+
         now = time.monotonic()
         async with rate_limit_lock:
             if recipient in pending_numbers:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "כבר מתבצעת שליחה למספר הזה. יש להמתין לסיום.",
                     ephemeral=True,
                 )
@@ -129,7 +155,7 @@ def build_bot(settings: Settings) -> commands.Bot:
                 remaining = RECIPIENT_COOLDOWN_SECONDS - (now - last_attempt)
                 if remaining > 0:
                     minutes = max(1, int((remaining + 59) // 60))
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         f"אפשר לנסות שוב למספר הזה בעוד כ-{minutes} דקות.",
                         ephemeral=True,
                     )
@@ -137,7 +163,6 @@ def build_bot(settings: Settings) -> commands.Bot:
 
             pending_numbers.add(recipient)
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             result = await asyncio.to_thread(
                 twilio_client.messages.create,
