@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 
 import discord
@@ -10,11 +9,16 @@ from discord import app_commands
 from discord.ext import commands
 from twilio.rest import Client
 
-from sms_opt_out import is_recipient_opted_out
+from discord_ui import SmsPanelView
+from sms_accounting import (
+    adjust_user_credits,
+    finish_sms_attempt,
+    get_credit_balance,
+    reserve_sms_attempt,
+)
 
 LOGGER = logging.getLogger("discord_sms_bot")
 MAX_MESSAGE_LENGTH = 500
-RECIPIENT_COOLDOWN_SECONDS = 60 * 60
 E164_PATTERN = re.compile(r"^\+[1-9][0-9]{7,14}$")
 
 
@@ -60,9 +64,6 @@ def build_bot(settings: Settings) -> commands.Bot:
         command_prefix="!",
         intents=discord.Intents.default(),
     )
-    last_attempt_by_number: dict[str, float] = {}
-    pending_numbers: set[str] = set()
-    rate_limit_lock = asyncio.Lock()
     synced_commands = False
 
     @bot.event
@@ -73,14 +74,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             synced_commands = True
         LOGGER.info("Bot connected as %s", bot.user)
 
-    @bot.tree.command(name="sms", description="שליחת הודעת SMS אחת")
-    @app_commands.describe(
-        number="מספר הנמען בפורמט בינלאומי, למשל ‎+972501234567",
-        message="תוכן ההודעה, עד 500 תווים",
-        consent="אישור שהנמען הסכים לקבל את ההודעה",
-    )
-    @app_commands.checks.has_permissions(administrator=True)
-    async def sms(
+    async def submit_sms(
         interaction: discord.Interaction,
         number: str,
         message: str,
@@ -119,50 +113,45 @@ def build_bot(settings: Settings) -> commands.Bot:
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            opted_out = await asyncio.to_thread(
-                is_recipient_opted_out,
+            reservation = await asyncio.to_thread(
+                reserve_sms_attempt,
+                str(interaction.user.id),
                 recipient,
+                consent,
             )
         except Exception as error:
             LOGGER.error(
-                "Could not verify SMS opt-out status (exception=%s)",
+                "Could not reserve SMS send (exception=%s)",
                 type(error).__name__,
             )
             await interaction.followup.send(
-                "לא ניתן לבדוק אם המספר הוסר. ההודעה לא נשלחה.",
+                "לא ניתן לאמת הסרה, קרדיטים או מגבלות שליחה. ההודעה לא נשלחה.",
                 ephemeral=True,
             )
             return
 
-        if opted_out:
+        if not reservation.allowed:
+            messages = {
+                "opted_out": "המספר ביקש להסיר את עצמו. ההודעה לא נשלחה.",
+                "no_credits": "אין מספיק קרדיטים. פנו לבעל הבוט לקבלת קרדיטים.",
+                "user_hourly_limit": "הגעתם למגבלת 3 הודעות בשעה למשתמש.",
+                "user_daily_limit": "הגעתם למגבלת 10 הודעות ב-24 שעות למשתמש.",
+                "recipient_hourly_limit": (
+                    "אפשר לשלוח למספר הזה הודעה אחת בלבד בכל שעה."
+                ),
+                "consent_required": "נדרשת הסכמה מפורשת של הנמען.",
+                "invalid_number": "יש להזין מספר בפורמט E.164.",
+            }
             await interaction.followup.send(
-                "המספר ביקש להסיר את עצמו. ההודעה לא נשלחה.",
+                messages.get(
+                    reservation.reason,
+                    "ההודעה לא אושרה לשליחה.",
+                ),
                 ephemeral=True,
             )
             return
 
-        now = time.monotonic()
-        async with rate_limit_lock:
-            if recipient in pending_numbers:
-                await interaction.followup.send(
-                    "כבר מתבצעת שליחה למספר הזה. יש להמתין לסיום.",
-                    ephemeral=True,
-                )
-                return
-
-            last_attempt = last_attempt_by_number.get(recipient)
-            if last_attempt is not None:
-                remaining = RECIPIENT_COOLDOWN_SECONDS - (now - last_attempt)
-                if remaining > 0:
-                    minutes = max(1, int((remaining + 59) // 60))
-                    await interaction.followup.send(
-                        f"אפשר לנסות שוב למספר הזה בעוד כ-{minutes} דקות.",
-                        ephemeral=True,
-                    )
-                    return
-
-            pending_numbers.add(recipient)
-
+        assert reservation.attempt_id is not None
         try:
             result = await asyncio.to_thread(
                 twilio_client.messages.create,
@@ -171,31 +160,212 @@ def build_bot(settings: Settings) -> commands.Bot:
                 to=recipient,
             )
         except Exception as error:
-            # Keep the cooldown after an uncertain provider response to avoid
-            # accidentally sending a duplicate if Twilio accepted the message.
-            async with rate_limit_lock:
-                pending_numbers.discard(recipient)
-                last_attempt_by_number[recipient] = time.monotonic()
+            try:
+                await asyncio.to_thread(
+                    finish_sms_attempt,
+                    reservation.attempt_id,
+                    "uncertain",
+                )
+            except Exception as update_error:
+                LOGGER.error(
+                    "Could not update uncertain SMS attempt (exception=%s)",
+                    type(update_error).__name__,
+                )
             LOGGER.error(
                 "Twilio SMS request failed (exception=%s, status=%s)",
                 type(error).__name__,
                 getattr(error, "status", "unknown"),
             )
             await interaction.followup.send(
-                "לא ניתן לאשר שההודעה נשלחה. כדי למנוע שליחה כפולה, "
-                "בדקו את מצב ההודעה ב-Twilio לפני ניסיון נוסף.",
+                "Twilio לא אישר את מצב ההודעה. הקרדיט ומגבלות השליחה נשמרים "
+                "כדי למנוע הודעה כפולה; בדקו את Twilio לפני ניסיון נוסף.",
                 ephemeral=True,
             )
             return
 
-        async with rate_limit_lock:
-            pending_numbers.discard(recipient)
-            last_attempt_by_number[recipient] = time.monotonic()
+        try:
+            await asyncio.to_thread(
+                finish_sms_attempt,
+                reservation.attempt_id,
+                "submitted",
+                result.sid,
+            )
+        except Exception as error:
+            LOGGER.error(
+                "Could not finalize submitted SMS attempt (exception=%s)",
+                type(error).__name__,
+            )
 
         await interaction.followup.send(
-            f"ההודעה נשלחה. מזהה Twilio: `{result.sid}`",
+            f"ההודעה הועברה ל-Twilio. מזהה: `{result.sid}`. "
+            f"יתרת קרדיטים: **{reservation.remaining_credits}**.",
             ephemeral=True,
         )
+
+    @bot.tree.command(name="sms", description="שליחת הודעת SMS אחת")
+    @app_commands.describe(
+        number="מספר הנמען בפורמט בינלאומי, למשל ‎+972501234567",
+        message="תוכן ההודעה, עד 500 תווים",
+        consent="אישור שהנמען הסכים לקבל את ההודעה",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def sms(
+        interaction: discord.Interaction,
+        number: str,
+        message: str,
+        consent: bool,
+    ) -> None:
+        await submit_sms(interaction, number, message, consent)
+
+    @bot.tree.command(
+        name="sms-panel",
+        description="פתיחת ממשק ה-SMS והקרדיטים",
+    )
+    async def sms_panel(interaction: discord.Interaction) -> None:
+        try:
+            balance = await asyncio.to_thread(
+                get_credit_balance,
+                str(interaction.user.id),
+            )
+            balance_text = str(balance)
+        except Exception as error:
+            LOGGER.error(
+                "Could not load SMS panel balance (exception=%s)",
+                type(error).__name__,
+            )
+            balance_text = "לא זמין"
+
+        embed = discord.Embed(
+            title="SMS Studio",
+            description=(
+                "שליחת SMS יחיד למקבל שנתן הסכמה. אין שליחה לרשימות או "
+                "שליחה אוטומטית."
+            ),
+            color=discord.Color.from_rgb(73, 68, 220),
+        )
+        embed.add_field(
+            name="הקרדיטים שלי",
+            value=balance_text,
+            inline=True,
+        )
+        embed.add_field(
+            name="מגבלות",
+            value=(
+                "קרדיט אחד להודעה · עד 3 למשתמש בשעה · "
+                "עד 10 למשתמש ב-24 שעות · אחת למספר בשעה"
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text="שליחה דורשת אישור הסכמה; בקשות הסרה נחסמות אוטומטית."
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=SmsPanelView(bot, submit_sms),
+            ephemeral=True,
+        )
+
+    credits_group = app_commands.Group(
+        name="credits",
+        description="בדיקה וניהול של קרדיטי SMS",
+    )
+
+    @credits_group.command(
+        name="balance",
+        description="בדיקת יתרת הקרדיטים שלך",
+    )
+    async def credits_balance(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            balance = await asyncio.to_thread(
+                get_credit_balance,
+                str(interaction.user.id),
+            )
+        except Exception as error:
+            LOGGER.error(
+                "Credit balance lookup failed (exception=%s)",
+                type(error).__name__,
+            )
+            await interaction.followup.send(
+                "לא ניתן לבדוק את יתרת הקרדיטים כרגע.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"יתרת הקרדיטים שלך: **{balance}**.",
+            ephemeral=True,
+        )
+
+    @credits_group.command(
+        name="grant",
+        description="הקצאת קרדיטים למשתמש",
+    )
+    @app_commands.checks.is_owner()
+    async def credits_grant(
+        interaction: discord.Interaction,
+        user: discord.User,
+        amount: app_commands.Range[int, 1, 100_000],
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            balance = await asyncio.to_thread(
+                adjust_user_credits,
+                str(interaction.user.id),
+                str(user.id),
+                amount,
+                "grant",
+            )
+        except Exception as error:
+            LOGGER.error(
+                "Owner credit grant failed (exception=%s)",
+                type(error).__name__,
+            )
+            await interaction.followup.send(
+                "לא ניתן לעדכן את הקרדיטים כרגע.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"הוקצו {amount} קרדיטים ל-{user.mention}. "
+            f"יתרה חדשה: **{balance}**.",
+            ephemeral=True,
+        )
+
+    @credits_group.command(
+        name="set",
+        description="קביעת יתרת קרדיטים למשתמש",
+    )
+    @app_commands.checks.is_owner()
+    async def credits_set(
+        interaction: discord.Interaction,
+        user: discord.User,
+        amount: app_commands.Range[int, 0, 100_000],
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            balance = await asyncio.to_thread(
+                adjust_user_credits,
+                str(interaction.user.id),
+                str(user.id),
+                amount,
+                "set",
+            )
+        except Exception as error:
+            LOGGER.error(
+                "Owner credit reset failed (exception=%s)",
+                type(error).__name__,
+            )
+            await interaction.followup.send(
+                "לא ניתן לעדכן את הקרדיטים כרגע.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"יתרת הקרדיטים של {user.mention} נקבעה ל-**{balance}**.",
+            ephemeral=True,
+        )
+
+    bot.tree.add_command(credits_group)
 
     @bot.tree.command(name="test", description="בדיקת פעילות הבוט")
     async def test(interaction: discord.Interaction) -> None:
@@ -222,6 +392,8 @@ def build_bot(settings: Settings) -> commands.Bot:
     ) -> None:
         if isinstance(error, app_commands.MissingPermissions):
             message = "רק מנהלי שרת יכולים להשתמש בפקודה הזו."
+        elif isinstance(error, app_commands.CheckFailure):
+            message = "רק בעל הבוט יכול להשתמש בפקודה הזו."
         else:
             LOGGER.error("Discord command failed (exception=%s)", type(error).__name__)
             message = "הפקודה נכשלה. נסו שוב מאוחר יותר."
